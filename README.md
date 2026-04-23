@@ -1,6 +1,6 @@
 # claude-audit
 
-CLI for the [Anthropic Compliance API](https://docs.anthropic.com/en/docs/administration/administration-api/compliance-api-reference).
+CLI for the [Anthropic Compliance API](https://support.claude.com/en/articles/13015708-access-the-compliance-api).
 
 See [CLAUDE.md](CLAUDE.md) for usage.
 
@@ -17,5 +17,5 @@ go build -o audit ./cmd/audit/
 
 ## Links
 
-- [Compliance API Reference](https://docs.anthropic.com/en/docs/administration/administration-api/compliance-api-reference)
+- [Compliance API Reference](https://support.claude.com/en/articles/13015708-access-the-compliance-api)
 - [Claude Enterprise](https://www.anthropic.com/enterprise)
