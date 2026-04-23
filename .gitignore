@@ -1,0 +1,24 @@
+# Binary
+/audit
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Environment (contains API keys and org-specific config)
+.env
+
+# Python
+scripts/__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/
+
+# PDFs (large binaries, keep markdown versions only)
+*.pdf
+
