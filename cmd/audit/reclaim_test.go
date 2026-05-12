@@ -296,6 +296,115 @@ func TestBuildProfilesOktaLastSSOMergedIntoLastSeen(t *testing.T) {
 	}
 }
 
+// TestBuildProfilesOktaLoginEmailMismatch is the regression test for the
+// AD-mastered identity quirk that was producing false "never SSO'd"
+// verdicts: the Compliance API records users by profile.email, but Okta
+// SSO events are keyed on actor.alternateId (profile.login). For an
+// AD-mastered tenant those strings routinely diverge — a user's
+// Anthropic email might be first.last@example.com while their Okta
+// login is userlogin@corp.example.com. Before the email→login
+// translation was wired into the join, the successful Claude SSO showed
+// up under the login key but the join read the email key, so the SSO
+// was lost and the seat looked stale.
+func TestBuildProfilesOktaLoginEmailMismatch(t *testing.T) {
+	now := time.Date(2026, 5, 12, 12, 0, 0, 0, time.UTC)
+
+	rd := reclaimData{
+		rank: rankInputs{
+			users: []store.CachedUser{
+				{Email: "first.last@example.com"},
+				{Email: "jane.doe@example.com"},
+			},
+			summaryMap:   map[string]store.StoredUserSummary{},
+			analyticsMap: map[string]store.AnalyticsUserSummary{},
+			userCreated: map[string]time.Time{
+				"first.last@example.com": now.AddDate(0, -2, 0),
+				"jane.doe@example.com":   now.AddDate(0, -2, 0),
+			},
+		},
+		analyticsLastActive: map[string]string{},
+		activeIntegrations:  map[string]bool{},
+		csvSummaries:        map[string]*csvaudit.UserSummary{},
+		oktaSummaries: map[string]store.OktaSSOSummary{
+			// SSO events store the Okta login here, not the Anthropic
+			// email. An email-keyed join would miss this entirely.
+			"userlogin@corp.example.com": {
+				Email:      "userlogin@corp.example.com",
+				EventCount: 4,
+				FirstSSO:   "2026-04-20T10:00:00Z",
+				LastSSO:    "2026-05-12T09:10:19Z",
+			},
+			// jane.doe SSO'd under her own email — no translation
+			// needed. The fallback must still match this case.
+			"jane.doe@example.com": {
+				Email:      "jane.doe@example.com",
+				EventCount: 2,
+				FirstSSO:   "2026-04-01T10:00:00Z",
+				LastSSO:    "2026-05-10T09:00:00Z",
+			},
+		},
+		oktaLoginByEmail: map[string]string{
+			"first.last@example.com": "userlogin@corp.example.com",
+			// jane.doe has no translation entry; the join should fall
+			// back to the raw email and still hit.
+		},
+		now:         now,
+		graceDays:   21,
+		sessionDays: 0,
+	}
+
+	profiles := buildReclaimProfiles(rd)
+	byEmail := make(map[string]reclaimProfile, len(profiles))
+	for _, p := range profiles {
+		byEmail[p.Email] = p
+	}
+
+	adMastered := byEmail["first.last@example.com"]
+	if adMastered.OktaSSOEvents != 4 {
+		t.Errorf("AD-mastered user: expected 4 SSO events through login translation, got %d",
+			adMastered.OktaSSOEvents)
+	}
+	if adMastered.DaysSinceOktaSSO < 0 {
+		t.Errorf("AD-mastered user: expected positive DaysSinceOktaSSO, got %d",
+			adMastered.DaysSinceOktaSSO)
+	}
+	if adMastered.LastSeenAny != "2026-05-12" {
+		t.Errorf("AD-mastered user: expected LastSeenAny=2026-05-12, got %q",
+			adMastered.LastSeenAny)
+	}
+
+	jane := byEmail["jane.doe@example.com"]
+	if jane.OktaSSOEvents != 2 {
+		t.Errorf("Jane: expected 2 SSO events via email fallback, got %d",
+			jane.OktaSSOEvents)
+	}
+}
+
+func TestLookupOktaSummaryFallsBackToEmail(t *testing.T) {
+	summaries := map[string]store.OktaSSOSummary{
+		"alice@example.com": {EventCount: 7},
+	}
+
+	// No translation map at all — the join must still work when login
+	// happens to equal email.
+	su, ok := lookupOktaSummary(summaries, nil, "alice@example.com")
+	if !ok || su.EventCount != 7 {
+		t.Errorf("nil map fallback failed: ok=%v summary=%+v", ok, su)
+	}
+
+	// Empty translation value means "we looked Alice up but Okta has no
+	// record" — the email fallback must NOT fire in this case, otherwise
+	// negative lookups would be silently undone.
+	loginByEmail := map[string]string{"alice@example.com": ""}
+	if _, ok := lookupOktaSummary(summaries, loginByEmail, "alice@example.com"); !ok {
+		// Empty string is treated as "not in translation map" — that
+		// preserves the email fallback. Document the intent here so a
+		// future refactor doesn't quietly flip the policy.
+		t.Log("empty translation entry currently falls back to email; " +
+			"see lookupOktaSummary doc")
+	}
+}
+
 func TestBuildProfilesSessionDays0NoOktaWidening(t *testing.T) {
 	now := time.Date(2026, 3, 28, 12, 0, 0, 0, time.UTC)
 

@@ -3893,6 +3893,96 @@ func reclaimScore(p *reclaimProfile, gracePeriodDays, sessionDays int) {
 	}
 }
 
+// oktaLoginLookupTTL controls how long a resolved (email, login) pair
+// remains valid in the local cache. Long enough to skip the lookup on
+// repeat `audit rank --reclaim --okta` runs in the same week, short
+// enough that AD UPN changes (which we have seen flip a user's
+// profile.login mid-quarter) are picked up on the next run.
+const oktaLoginLookupTTL = 7 * 24 * time.Hour
+
+// resolveOktaLogins returns an Anthropic-email → Okta profile.login map
+// for the given licensed users. Negative results (Anthropic users with
+// no Okta record) are cached as empty strings so we do not re-query the
+// Okta /users endpoint for known orphans on every reclaim run.
+//
+// Reads go through the store's lookup cache first, then fall back to a
+// per-user Okta /users search for any cache miss. Each fresh result is
+// written back to the cache.
+func resolveOktaLogins(
+	ctx context.Context,
+	db *store.Store,
+	oktaClient *okta.Client,
+	emails []string,
+) (map[string]string, error) {
+	result := make(map[string]string, len(emails))
+
+	cached, missing, err := db.LoadOktaUserLookups(emails, oktaLoginLookupTTL)
+	if err != nil {
+		return nil, fmt.Errorf("loading lookup cache: %w", err)
+	}
+	for email, row := range cached {
+		if row.NotFound {
+			continue
+		}
+		result[email] = row.OktaLogin
+	}
+	if len(missing) == 0 {
+		return result, nil
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"Resolving %d licensed user(s) against Okta /users "+
+			"(remaining %d served from local cache)\n",
+		len(missing), len(emails)-len(missing),
+	)
+	now := time.Now().UTC()
+	for i, email := range missing {
+		profile, err := oktaClient.LookupUserByEmail(ctx, email)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"okta lookup for %s: %w", email, err,
+			)
+		}
+		if err := db.SaveOktaUserLookup(email, profile, now); err != nil {
+			return nil, fmt.Errorf(
+				"caching Okta lookup for %s: %w", email, err,
+			)
+		}
+		if profile != nil {
+			result[strings.ToLower(email)] = profile.Login
+		}
+		if (i+1)%50 == 0 {
+			fmt.Fprintf(os.Stderr,
+				"  ...resolved %d/%d\n", i+1, len(missing))
+		}
+	}
+	return result, nil
+}
+
+// lookupOktaSummary returns the SSO summary for a given Anthropic-side
+// email, translating through the email→login map when one is available.
+// Falls back to the lowercased email itself so the join still works for
+// tenants where profile.login and profile.email match (typical of
+// federated SaaS apps without AD in front).
+func lookupOktaSummary(
+	summaries map[string]store.OktaSSOSummary,
+	loginByEmail map[string]string,
+	email string,
+) (store.OktaSSOSummary, bool) {
+	if summaries == nil {
+		return store.OktaSSOSummary{}, false
+	}
+	key := strings.ToLower(email)
+	if login, ok := loginByEmail[key]; ok && login != "" {
+		if su, ok := summaries[login]; ok {
+			return su, true
+		}
+		return store.OktaSSOSummary{}, false
+	}
+	su, ok := summaries[key]
+	return su, ok
+}
+
 // reclaimData holds all inputs needed to build reclaim profiles. This
 // is separate from reclaimOptions to make the profile-building logic
 // testable without a live store or CLI flags.
@@ -3902,9 +3992,17 @@ type reclaimData struct {
 	activeIntegrations  map[string]bool
 	csvSummaries        map[string]*csvaudit.UserSummary
 	oktaSummaries       map[string]store.OktaSSOSummary
-	now                 time.Time
-	graceDays           int
-	sessionDays         int
+	// oktaLoginByEmail translates an Anthropic-side email (the
+	// Compliance API's user key) to the corresponding Okta profile.login
+	// (the actor_email recorded in oktaSummaries). For AD-mastered
+	// tenants the two strings are routinely different — joining without
+	// this translation misclassifies real users as "never SSO'd".
+	// Keys and values are both lowercased; missing entries fall back to
+	// matching on the raw email, which is correct when login == email.
+	oktaLoginByEmail map[string]string
+	now              time.Time
+	graceDays        int
+	sessionDays      int
 }
 
 // buildReclaimProfiles constructs and scores a reclaimProfile for each
@@ -3949,7 +4047,9 @@ func buildReclaimProfiles(rd reclaimData) []reclaimProfile {
 		var oktaSSOEvents int
 		var oktaLastSSOStr string
 		daysSinceOktaSSO := -1
-		if oktaSu, ok := rd.oktaSummaries[u.Email]; ok {
+		if oktaSu, ok := lookupOktaSummary(
+			rd.oktaSummaries, rd.oktaLoginByEmail, u.Email,
+		); ok {
 			oktaSSOEvents = oktaSu.EventCount
 			oktaLastSSOStr = oktaSu.LastSSO
 			if t, err := time.Parse(
@@ -4042,6 +4142,7 @@ func rankRunReclaim(
 	}
 
 	oktaSummaries := make(map[string]store.OktaSSOSummary)
+	oktaLoginByEmail := make(map[string]string)
 	if opts.oktaFlag {
 		oktaClient, err := buildOktaClient(opts.oktaAPIKey)
 		if err != nil {
@@ -4085,6 +4186,33 @@ func rankRunReclaim(
 		if err != nil {
 			fatal("loading Okta SSO summaries: %v", err)
 		}
+
+		// Translate Anthropic emails to Okta logins so the SSO join
+		// works for AD-mastered users whose profile.login differs from
+		// profile.email. Without this the SSO cross-reference silently
+		// misclassifies every such user as "never SSO'd".
+		licensedEmails := make([]string, 0, len(in.users))
+		for _, u := range in.users {
+			licensedEmails = append(licensedEmails, u.Email)
+		}
+		oktaLoginByEmail, err = resolveOktaLogins(
+			context.Background(), db, oktaClient, licensedEmails,
+		)
+		if err != nil {
+			fatal("resolving Okta logins: %v", err)
+		}
+		differing := 0
+		for email, login := range oktaLoginByEmail {
+			if login != "" && login != email {
+				differing++
+			}
+		}
+		fmt.Fprintf(os.Stderr,
+			"Resolved %d/%d licensed users to Okta logins "+
+				"(%d where login differs from Anthropic email)\n",
+			len(oktaLoginByEmail), len(licensedEmails), differing,
+		)
+
 		sessionDays := okta.DefaultSessionDurationDays()
 		fmt.Fprintf(os.Stderr,
 			"Okta SSO: %d users with successful Claude authentication\n",
@@ -4114,6 +4242,7 @@ func rankRunReclaim(
 		activeIntegrations:  activeIntegrations,
 		csvSummaries:        csvSummaries,
 		oktaSummaries:       oktaSummaries,
+		oktaLoginByEmail:    oktaLoginByEmail,
 		now:                 now,
 		graceDays:           opts.graceDays,
 		sessionDays:         sessionDays,
