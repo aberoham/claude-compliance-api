@@ -685,3 +685,130 @@ golangci-lint run
 
 - `modernc.org/sqlite` — Pure Go SQLite driver (no CGo required)
 - Standard library for everything else (HTTP, JSON, CSV, zip, CLI flags)
+
+## Tenant data hygiene (PII rules)
+
+This repository is public. Every commit — code, tests, comments, commit
+messages, PR descriptions, docs — is permanently visible on GitHub
+(and reachable via direct-SHA URLs even after force-push, until GitHub
+garbage-collects, which can take up to 90 days).
+
+Real tenant data has leaked into this repo before via test fixtures,
+docstrings, and PR descriptions written from live debugging sessions.
+A subsequent history rewrite and force-push was required to scrub it.
+Do not repeat that mistake. Treat every artifact you commit as if it
+will be screenshotted by a third party tomorrow.
+
+### Hard rules — never commit
+
+1. **Real customer organization names.** Do not write "Acme Corp",
+   "Initech", or any specific customer's name in source, tests,
+   comments, commit messages, or PR descriptions. If you must
+   describe deployment context, use generic phrasing: "an
+   AD-mastered enterprise tenant", "a large SaaS-only IdP",
+   "a live Okta tenant".
+2. **Real human names.** No first names, last names, or full names of
+   actual users — not in test fixtures, not in test failure messages
+   (`t.Errorf("Firstname: ...")`), not in code comments. Use role names
+   ("the AD-mastered user", "the orphan", "the admin") or synthetic
+   placeholders ("alice", "bob", "first.last").
+3. **Real email addresses on real domains.** All emails in fixtures,
+   examples, and documentation must use IANA reserved domains:
+   `example.com`, `example.org`, `example.net`, `example.test`,
+   `corp.example.com`, `corp.example.org`. Anything else is a leak.
+4. **Real Okta object IDs.** Okta UUIDs are stable, customer-specific
+   identifiers (`00u…` for users, `0oa…` for app instances, `00g…`
+   for groups, `exk…` for IdPs). In fixtures use clearly synthetic
+   placeholders like `00uABCDEF123`, `0oaXYZ`, `00gTEST`. Never paste
+   a UUID copied from a live system log.
+5. **Real tenant hostnames.** No `<customer>.okta.com`,
+   `<customer>-admin.okta.com`, or any other URL that names a
+   specific tenant. In examples write `your-org.okta.com`,
+   `https://<okta-domain>/...`, or use the env-var placeholder
+   `$OKTA_DOMAIN`.
+6. **Network identifiers tied to a customer.** Specific source IPs,
+   ASNs, or geo strings copied from a real event ("Manchester, UK
+   via Netskope 158.95.x.y") belong only in private operator notes,
+   never in this repository.
+
+### Where rule violations hide
+
+- **Test data copied from live debugging.** When fixing a bug you saw
+  in production, the most natural thing to do is paste the offending
+  record into a test as-is. Always sanitize before committing.
+  Rename identifiers, generalize comments.
+- **Test failure messages.** `t.Errorf("Firstname: expected ...")`
+  leaks a name even though no email or ID appears. Use role-based
+  labels in `Errorf` strings (e.g. `t.Errorf("AD-mastered user: ...")`).
+- **Docstrings and Go comments.** Comments like
+  "// Real AD-mastered CustomerName case: login on the corporate
+  domain..." name a customer in a comment that describes intent.
+  Generalize to "// Real-world AD-mastered case".
+- **PR descriptions and commit messages.** A line like "Confirmed in
+  production against `customer-admin.okta.com`: 269 of 344 licensed
+  users had ..." names the customer and exposes their seat count.
+  Strip the hostname, round or omit the numbers, or describe the
+  deployment shape ("AD-mastered tenant") instead.
+- **README / SKILL.md / docs examples.** Default-value tables that
+  show "`--org` | Customer Name | Organization ID" leak the org of
+  whoever wrote the example. Use `Example Org` or `your-org` as the
+  placeholder.
+- **Inline-script metadata and config snippets.** Don't paste real
+  `.env` values into examples. Use `OKTA_DOMAIN=your-org.okta.com`.
+
+### Pre-commit checklist
+
+Before staging any commit that touches Go source, tests, docs, or
+markdown, run the following sweep from the repo root. **A non-empty
+match is a stop-the-line event** — either the match is intentional
+and harmless, or it must be sanitized before the commit lands.
+
+```bash
+# Domains that aren't IANA-reserved test domains.
+rg -nIi '\b[a-z0-9.-]+\.(com|net|org|io|co\.[a-z]{2}|[a-z]{2})\b' \
+   --type-add 'doc:*.md' -t go -t doc \
+   | rg -v 'example\.(com|org|net|test)|corp\.example\.|\.invalid\b|\.localhost\b'
+
+# Bare Okta object IDs that aren't obviously synthetic.
+rg -n '\b(00u|0oa|00g|exk|gua|guo|bhv|idx|app)[a-zA-Z0-9]{6,}\b' \
+   --type go --type-add 'doc:*.md' -t doc \
+   | rg -v 'ABCDEF|TEST|XYZ|123|app-claude|app-other|app-[a-z]+-?\d+'
+
+# Specific known-bad tokens (customer names, employee names, tenant
+# hostnames). Maintain this list privately — keeping the exact tokens
+# out of the repo itself, since CLAUDE.md is committed and public.
+# Example: store the list at .git/info/pii-tokens and source it.
+rg -niIf "$(git rev-parse --git-dir)/info/pii-tokens" . 2>/dev/null \
+  || echo "  (no token list configured at .git/info/pii-tokens — skipping)"
+```
+
+If any of these turn up matches in a file you are about to commit,
+sanitize before staging. The first two greps will have false
+positives (intentional generic examples) — read the matches, do not
+just count them.
+
+### Pre-commit hook
+
+The user has `prek` installed globally. Add a hook to
+`.pre-commit-config.yaml` that runs the three greps above and fails
+the commit on any match. The hook is the only thing that catches the
+mistake reliably — a written rule that depends on human discipline
+will be skipped under pressure.
+
+### If you see real tenant data during a session
+
+The user will sometimes paste real Okta system log events, real user
+records, or real tenant URLs into the chat to ask diagnostic
+questions. That is fine — those messages are private. Use the data
+to answer the question. But:
+
+- Never copy the data verbatim into a test fixture, comment, commit
+  message, or PR description.
+- When writing the fix, translate every identifier to a synthetic
+  equivalent. Keep the *shape* of the data (so the test still
+  exercises the real edge case) but lose the strings.
+- When describing the fix in a commit or PR, refer to the deployment
+  shape (e.g. "AD-mastered tenant") not the customer name.
+- If the user asks you to commit something that contains real tenant
+  data, stop and ask before staging. Force-pushing to scrub after
+  the fact is expensive and incomplete.
