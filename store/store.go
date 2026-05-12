@@ -145,6 +145,13 @@ CREATE TABLE IF NOT EXISTS okta_sso_events (
 
 CREATE INDEX IF NOT EXISTS idx_okta_sso_actor ON okta_sso_events(actor_email);
 CREATE INDEX IF NOT EXISTS idx_okta_sso_published ON okta_sso_events(published);
+
+CREATE TABLE IF NOT EXISTS okta_user_lookups (
+    email         TEXT PRIMARY KEY,
+    okta_user_id  TEXT NOT NULL,
+    okta_login    TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL
+);
 `
 
 // DefaultPath returns the conventional database path under the user's local

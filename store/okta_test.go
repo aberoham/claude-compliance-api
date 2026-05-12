@@ -217,3 +217,81 @@ func TestOktaTimestampBoundaryFiltering(t *testing.T) {
 			summaries["alice@example.com"].EventCount)
 	}
 }
+
+func TestOktaUserLookupRoundTrip(t *testing.T) {
+	s := openTestDB(t)
+	defer s.Close()
+
+	now := time.Now().UTC()
+	hit := &okta.UserProfile{
+		ID:    "00uABC",
+		Login: "userlogin@corp.example.com",
+		Email: "first.last@example.com",
+	}
+	if err := s.SaveOktaUserLookup(
+		"first.last@example.com", hit, now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Negative cache: email exists in Anthropic but not in Okta.
+	if err := s.SaveOktaUserLookup(
+		"orphan@example.com", nil, now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	cached, missing, err := s.LoadOktaUserLookups(
+		[]string{
+			"first.last@example.com",
+			"orphan@example.com",
+			"never-fetched@example.com",
+		},
+		time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cached) != 2 {
+		t.Fatalf("expected 2 cached entries, got %d", len(cached))
+	}
+	h := cached["first.last@example.com"]
+	if h.OktaLogin != "userlogin@corp.example.com" || h.OktaUserID != "00uABC" {
+		t.Errorf("hit row wrong: %+v", h)
+	}
+	if h.NotFound {
+		t.Error("hit row should not be marked NotFound")
+	}
+	if o := cached["orphan@example.com"]; !o.NotFound {
+		t.Errorf("orphan should be NotFound: %+v", o)
+	}
+	if len(missing) != 1 || missing[0] != "never-fetched@example.com" {
+		t.Errorf("missing wrong: %v", missing)
+	}
+}
+
+func TestOktaUserLookupTTLExpiry(t *testing.T) {
+	s := openTestDB(t)
+	defer s.Close()
+
+	stale := time.Now().UTC().Add(-2 * time.Hour)
+	if err := s.SaveOktaUserLookup(
+		"stale@example.com",
+		&okta.UserProfile{ID: "x", Login: "stale-login"},
+		stale,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	cached, missing, err := s.LoadOktaUserLookups(
+		[]string{"stale@example.com"}, time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cached) != 0 {
+		t.Errorf("stale row should be evicted, got %+v", cached)
+	}
+	if len(missing) != 1 {
+		t.Errorf("expected 1 missing, got %v", missing)
+	}
+}
