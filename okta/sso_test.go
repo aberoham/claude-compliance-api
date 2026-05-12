@@ -258,6 +258,69 @@ func TestFetchConstructsBoundedQuery(t *testing.T) {
 	}
 }
 
+// TestPaginationFollowsTwoLinkHeaders mimics Okta's real wire format, which
+// returns the self and next pagination links as two separate Link header
+// lines. Earlier code used http.Header.Get("Link") and silently dropped the
+// rel="next" entry, capping SSO ingestion at one page (1000 events) and
+// hiding the rest of the requested window.
+func TestPaginationFollowsTwoLinkHeaders(t *testing.T) {
+	page1 := []LogEvent{
+		{
+			UUID:      "evt-page1",
+			Published: time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC),
+			EventType: "user.authentication.sso",
+			Actor:     Actor{AlternateID: "alice@example.com"},
+			Target: []Target{
+				{Type: "AppInstance", DisplayName: "Anthropic Claude"},
+			},
+			Outcome: Outcome{Result: "SUCCESS"},
+		},
+	}
+	page2 := []LogEvent{
+		{
+			UUID:      "evt-page2",
+			Published: time.Date(2026, 3, 11, 12, 0, 0, 0, time.UTC),
+			EventType: "user.authentication.sso",
+			Actor:     Actor{AlternateID: "bob@example.com"},
+			Target: []Target{
+				{Type: "AppInstance", DisplayName: "Anthropic Claude"},
+			},
+			Outcome: Outcome{Result: "SUCCESS"},
+		},
+	}
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("after") == "" {
+				w.Header().Add("Link",
+					`<`+srv.URL+`/api/v1/logs>; rel="self"`)
+				w.Header().Add("Link",
+					`<`+srv.URL+`/api/v1/logs?after=cursor>; rel="next"`)
+				json.NewEncoder(w).Encode(page1)
+				return
+			}
+			w.Header().Add("Link",
+				`<`+srv.URL+`/api/v1/logs?after=cursor>; rel="self"`)
+			json.NewEncoder(w).Encode(page2)
+		}))
+	defer srv.Close()
+
+	matched, err := testClient(srv.URL).FetchClaudeSSOEvents(
+		context.Background(), testSince, testUntil,
+		"", defaultClaudeAppName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched) != 2 {
+		t.Fatalf("expected 2 events across two pages, got %d", len(matched))
+	}
+	if matched[0].UUID != "evt-page1" || matched[1].UUID != "evt-page2" {
+		t.Errorf("page order wrong: got %q, %q",
+			matched[0].UUID, matched[1].UUID)
+	}
+}
+
 func TestMatchedTargetPropagated(t *testing.T) {
 	events := []LogEvent{
 		{

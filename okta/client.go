@@ -172,7 +172,7 @@ func (c *Client) doRequest(
 			)
 		}
 
-		next := parseLinkNext(resp.Header.Get("Link"))
+		next := parseLinkNext(resp.Header.Values("Link"))
 		return respBody, next, nil
 	}
 	if lastErr != nil {
@@ -220,14 +220,17 @@ func rateLimitWait(h http.Header) time.Duration {
 	return wait
 }
 
-// parseLinkNext extracts the URL with rel="next" from an RFC 5988
-// Link header. Returns empty string if no next link is present.
-func parseLinkNext(link string) string {
-	if link == "" {
-		return ""
-	}
-	for _, part := range strings.Split(link, ",") {
-		if strings.Contains(part, `rel="next"`) {
+// parseLinkNext extracts the URL with rel="next" from one or more RFC 5988
+// Link header values. Okta returns the self and next pagination links as two
+// distinct Link headers rather than a single comma-joined value, so callers
+// must pass resp.Header.Values("Link") — not Header.Get, which only returns
+// the first header line and silently drops the rel="next" entry.
+func parseLinkNext(links []string) string {
+	for _, link := range links {
+		for _, part := range strings.Split(link, ",") {
+			if !strings.Contains(part, `rel="next"`) {
+				continue
+			}
 			url := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
 			return strings.Trim(url, "<>")
 		}

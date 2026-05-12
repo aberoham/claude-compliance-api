@@ -59,33 +59,45 @@ func TestRateLimitReset(t *testing.T) {
 func TestLinkHeaderPagination(t *testing.T) {
 	tests := []struct {
 		name     string
-		link     string
+		links    []string
 		expected string
 	}{
 		{
 			name:     "standard next link",
-			link:     `<https://test.okta.com/api/v1/logs?after=abc>; rel="next"`,
+			links:    []string{`<https://test.okta.com/api/v1/logs?after=abc>; rel="next"`},
 			expected: "https://test.okta.com/api/v1/logs?after=abc",
 		},
 		{
-			name:     "multiple links",
-			link:     `<https://test.okta.com/self>; rel="self", <https://test.okta.com/next>; rel="next"`,
+			name:     "comma-joined self and next",
+			links:    []string{`<https://test.okta.com/self>; rel="self", <https://test.okta.com/next>; rel="next"`},
+			expected: "https://test.okta.com/next",
+		},
+		{
+			// Okta's real wire format: two distinct Link header lines, one
+			// per relation. http.Header.Values() preserves both; Header.Get()
+			// would return only the first and drop the next link, capping
+			// pagination at one page.
+			name: "two separate Link headers (Okta wire format)",
+			links: []string{
+				`<https://test.okta.com/self>; rel="self"`,
+				`<https://test.okta.com/next>; rel="next"`,
+			},
 			expected: "https://test.okta.com/next",
 		},
 		{
 			name:     "no next link",
-			link:     `<https://test.okta.com/self>; rel="self"`,
+			links:    []string{`<https://test.okta.com/self>; rel="self"`},
 			expected: "",
 		},
 		{
-			name:     "empty link",
-			link:     "",
+			name:     "no link headers",
+			links:    nil,
 			expected: "",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseLinkNext(tt.link)
+			got := parseLinkNext(tt.links)
 			if got != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, got)
 			}
