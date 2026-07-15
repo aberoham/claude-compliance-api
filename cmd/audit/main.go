@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -33,6 +35,12 @@ func main() {
 	switch os.Args[1] {
 	case "fetch":
 		cmdFetch(os.Args[2:])
+	case "hydrate":
+		cmdHydrate(os.Args[2:])
+	case "sync-resources":
+		cmdSyncResources(os.Args[2:])
+	case "compliance":
+		cmdCompliance(os.Args[2:])
 	case "users":
 		cmdUsers(os.Args[2:])
 	case "compare":
@@ -116,6 +124,9 @@ func printUsage() {
 
 Commands:
   fetch               Fetch activities from Compliance API (incremental)
+  hydrate             Fetch users, activities, chat metadata, and transcripts
+  sync-resources      Mirror the full Compliance API resource graph into cache
+  compliance          Access the full Compliance API resource surface
   users               List licensed users
   compare <csv>       Compare API activities against CSV export
   projects            List projects
@@ -284,6 +295,266 @@ func cmdFetch(args []string) {
 		totalFetched, totalInserted, prevCount)
 
 	printStoreSummary(db)
+}
+
+// cmdHydrate builds a local, resumable cache for broad analysis: licensed
+// users, recent activity feed rows, chat metadata, and full transcript JSON.
+func cmdHydrate(args []string) {
+	fs := flag.NewFlagSet("hydrate", flag.ExitOnError)
+	days := fs.Int("days", 90, "Number of days of history to fetch")
+	dbPath := fs.String("db", store.DefaultPath(), "Path to SQLite database")
+	orgID := fs.String("org", compliance.DefaultOrgID(), "Organization ID")
+	apiKey := fs.String("api-key", "", "API key (if unset, reads from 1Password)")
+	skipActivities := fs.Bool("skip-activities", false, "Skip Activity Feed fetch")
+	skipTranscripts := fs.Bool("skip-transcripts", false, "Skip full chat transcript download")
+	refreshTranscripts := fs.Bool("refresh-transcripts", false, "Re-fetch transcripts already stored locally")
+	concurrency := fs.Int("concurrency", 4, "Concurrent chat transcript fetches")
+	chatPageLimit := fs.Int("chat-page-limit", 1000, "Chat list page size (max 1000)")
+	if err := fs.Parse(args); err != nil {
+		fatal("parsing flags: %v", err)
+	}
+	if *days <= 0 {
+		fatal("--days must be positive")
+	}
+	if *concurrency <= 0 {
+		fatal("--concurrency must be positive")
+	}
+	if *chatPageLimit <= 0 || *chatPageLimit > 1000 {
+		fatal("--chat-page-limit must be between 1 and 1000")
+	}
+
+	ctx := context.Background()
+	client, err := buildClient(*apiKey, *orgID)
+	if err != nil {
+		fatal("creating API client: %v", err)
+	}
+
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		fatal("opening database: %v", err)
+	}
+	defer db.Close()
+
+	fmt.Fprintf(os.Stderr, "Database: %s\n", db.Path())
+	since := time.Now().UTC().AddDate(0, 0, -*days)
+
+	fmt.Fprintln(os.Stderr, "Fetching licensed users from API...")
+	users, err := client.FetchUsers(ctx)
+	if err != nil {
+		fatal("fetching users: %v", err)
+	}
+	if err := db.InsertUsers(users, time.Now().UTC()); err != nil {
+		fatal("storing users: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "Cached %d users\n", len(users))
+
+	if !*skipActivities {
+		fmt.Fprintf(os.Stderr, "Fetching Activity Feed back to %s...\n", since.Format("2006-01-02"))
+		rankFetchActivities(ctx, client, db, *days)
+	}
+
+	if *skipTranscripts {
+		printHydrateSummary(db)
+		return
+	}
+
+	userIDSet := make(map[string]bool)
+	for _, user := range users {
+		if user.ID != "" {
+			userIDSet[user.ID] = true
+		}
+	}
+	activityUserIDs, err := db.ActivityActorIDs(since)
+	if err != nil {
+		fatal("reading activity actor IDs: %v", err)
+	}
+	activityOnly := 0
+	for _, id := range activityUserIDs {
+		if id == "" {
+			continue
+		}
+		if !userIDSet[id] {
+			activityOnly++
+		}
+		userIDSet[id] = true
+	}
+	var userIDs []string
+	for id := range userIDSet {
+		userIDs = append(userIDs, id)
+	}
+	sort.Strings(userIDs)
+
+	fmt.Fprintf(os.Stderr, "Fetching chat metadata since %s...\n", since.Format("2006-01-02"))
+	fmt.Fprintf(os.Stderr, "Listing chats for %d user IDs (%d licensed, %d activity-only)\n",
+		len(userIDs), len(users), activityOnly)
+	var allChats []compliance.Chat
+	seenChatIDs := make(map[string]bool)
+	for batchNum, batch := range stringBatches(userIDs, 10) {
+		chats, err := client.FetchChats(ctx, compliance.ChatQuery{
+			UserIDs:      batch,
+			CreatedAtGte: &since,
+			Limit:        *chatPageLimit,
+		})
+		if err != nil {
+			fatal("fetching chats for user batch %d: %v", batchNum+1, err)
+		}
+		if err := db.InsertChats(chats, time.Now().UTC()); err != nil {
+			fatal("storing chats for user batch %d: %v", batchNum+1, err)
+		}
+		for _, chat := range chats {
+			if seenChatIDs[chat.ID] {
+				continue
+			}
+			seenChatIDs[chat.ID] = true
+			allChats = append(allChats, chat)
+		}
+		fmt.Fprintf(os.Stderr, "  User batch %d: cached %d chats (%d total)\n",
+			batchNum+1, len(chats), len(allChats))
+	}
+
+	missingCached, err := db.ChatsMissingTranscripts(since)
+	if err != nil {
+		fatal("reading cached chats missing transcripts: %v", err)
+	}
+	addedMissing := 0
+	for _, chat := range missingCached {
+		if seenChatIDs[chat.ID] {
+			continue
+		}
+		seenChatIDs[chat.ID] = true
+		allChats = append(allChats, chat)
+		addedMissing++
+	}
+	if addedMissing > 0 {
+		fmt.Fprintf(os.Stderr, "Added %d cached chat metadata rows still missing transcripts\n", addedMissing)
+	}
+
+	sort.Slice(allChats, func(i, j int) bool {
+		return allChats[i].CreatedAt < allChats[j].CreatedAt
+	})
+
+	if len(allChats) == 0 {
+		fmt.Fprintln(os.Stderr, "No chats found in requested window.")
+		printHydrateSummary(db)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "Fetching %d full chat transcripts with concurrency %d...\n",
+		len(allChats), *concurrency)
+	hydrateTranscripts(ctx, client, db, allChats, *concurrency, *refreshTranscripts)
+	printHydrateSummary(db)
+}
+
+func stringBatches(values []string, size int) [][]string {
+	if size <= 0 {
+		size = 10
+	}
+	var batches [][]string
+	for start := 0; start < len(values); start += size {
+		end := start + size
+		if end > len(values) {
+			end = len(values)
+		}
+		batches = append(batches, values[start:end])
+	}
+	return batches
+}
+
+func hydrateTranscripts(
+	ctx context.Context,
+	client *compliance.Client,
+	db *store.Store,
+	chats []compliance.Chat,
+	concurrency int,
+	refresh bool,
+) {
+	jobs := make(chan compliance.Chat)
+	total := int64(len(chats))
+	var processed int64
+	var fetched int64
+	var skipped int64
+	var failed int64
+	var wg sync.WaitGroup
+	var insertMu sync.Mutex
+
+	for worker := 0; worker < concurrency; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for meta := range jobs {
+				if !refresh {
+					exists, err := db.HasChatTranscript(meta.ID)
+					if err != nil {
+						atomic.AddInt64(&failed, 1)
+						fmt.Fprintf(os.Stderr, "  Warning: checking transcript %s: %v\n", meta.ID, err)
+						reportHydrateProgress(&processed, total, &fetched, &skipped, &failed)
+						continue
+					}
+					if exists {
+						atomic.AddInt64(&skipped, 1)
+						reportHydrateProgress(&processed, total, &fetched, &skipped, &failed)
+						continue
+					}
+				}
+
+				chat, raw, err := client.GetChatRaw(ctx, meta.ID)
+				if err != nil {
+					atomic.AddInt64(&failed, 1)
+					fmt.Fprintf(os.Stderr, "  Warning: fetching transcript %s: %v\n", meta.ID, err)
+					reportHydrateProgress(&processed, total, &fetched, &skipped, &failed)
+					continue
+				}
+				insertMu.Lock()
+				err = db.InsertChatTranscript(chat, raw, time.Now().UTC())
+				insertMu.Unlock()
+				if err != nil {
+					atomic.AddInt64(&failed, 1)
+					fmt.Fprintf(os.Stderr, "  Warning: storing transcript %s: %v\n", meta.ID, err)
+					reportHydrateProgress(&processed, total, &fetched, &skipped, &failed)
+					continue
+				}
+				atomic.AddInt64(&fetched, 1)
+				reportHydrateProgress(&processed, total, &fetched, &skipped, &failed)
+			}
+		}()
+	}
+
+	for _, chat := range chats {
+		jobs <- chat
+	}
+	close(jobs)
+	wg.Wait()
+
+	fmt.Fprintf(os.Stderr, "Transcript fetch complete: %d fetched, %d skipped, %d failed\n",
+		atomic.LoadInt64(&fetched), atomic.LoadInt64(&skipped), atomic.LoadInt64(&failed))
+}
+
+func reportHydrateProgress(
+	processed *int64,
+	total int64,
+	fetched *int64,
+	skipped *int64,
+	failed *int64,
+) {
+	done := atomic.AddInt64(processed, 1)
+	if done == 1 || done%25 == 0 || done == total {
+		fmt.Fprintf(os.Stderr, "  Transcripts %d/%d: %d fetched, %d skipped, %d failed\n",
+			done, total,
+			atomic.LoadInt64(fetched),
+			atomic.LoadInt64(skipped),
+			atomic.LoadInt64(failed),
+		)
+	}
+}
+
+func printHydrateSummary(db *store.Store) {
+	activities, _ := db.ActivityCount()
+	chats, _ := db.ChatCount()
+	transcripts, _ := db.ChatTranscriptCount()
+	fmt.Printf("\nLocal cache summary:\n")
+	fmt.Printf("  Activities:       %d\n", activities)
+	fmt.Printf("  Chat metadata:    %d\n", chats)
+	fmt.Printf("  Chat transcripts: %d\n", transcripts)
 }
 
 // cmdUsers lists licensed users from the API.
@@ -880,7 +1151,8 @@ func cmdChats(args []string) {
 	fetchedAt, _ := db.ChatsFetchedAt()
 	cacheValid := !fetchedAt.IsZero() && time.Since(fetchedAt) < ttl
 
-	// The chats API requires user_ids[], so we need to convert email to user ID.
+	// Convert an optional email filter to a user ID. The current API also
+	// supports organization-wide enumeration when user_ids[] is omitted.
 	var userIDs []string
 	if *userFilter != "" {
 		user, err := db.UserByEmail(*userFilter)
@@ -893,10 +1165,6 @@ func cmdChats(args []string) {
 	if cacheValid && !*refreshFlag {
 		fmt.Fprintf(os.Stderr, "Using cached chat list (fetched %s ago)\n", time.Since(fetchedAt).Round(time.Minute))
 	} else {
-		if len(userIDs) == 0 {
-			fatal("--user is required for fetching chats from API (chats API requires user_ids[])")
-		}
-
 		client, err := buildClient(*apiKey, *orgID)
 		if err != nil {
 			fatal("creating API client: %v", err)
@@ -1444,7 +1712,7 @@ func buildActivitySummary(activities []compliance.Activity, email string) ChatAn
 	// Count event types, detect primary client, and build weekly activity data.
 	typeCounts := make(map[string]int)
 	clientCounts := make(map[string]int)
-	weeklyEvents := make(map[string]int)    // week start date -> event count
+	weeklyEvents := make(map[string]int)           // week start date -> event count
 	weeklyDays := make(map[string]map[string]bool) // week start date -> set of active days
 
 	for _, a := range activities {
@@ -1681,7 +1949,7 @@ func selectAndFetchChats(ctx context.Context, client *compliance.Client, allChat
 
 	// Always include first and last chat, then sample from the middle.
 	var selected []compliance.Chat
-	selected = append(selected, allChats[0])              // oldest
+	selected = append(selected, allChats[0])               // oldest
 	selected = append(selected, allChats[len(allChats)-1]) // newest
 
 	// Shuffle middle chats for random sampling.
@@ -2790,7 +3058,7 @@ func cmdRank(args []string) {
 		"Compliance API key (if unset, reads from 1Password)")
 	analyticsKey := fs.String("analytics-api-key", "",
 		"Analytics API key (if unset, reads from 1Password)")
-	days := fs.Int("days", 30, "Number of days of history")
+	days := fs.Int("days", 90, "Number of days of history")
 	refreshFlag := fs.Bool("refresh", false, "Force re-fetch before ranking")
 	jsonFlag := fs.Bool("json", false, "Output as JSON")
 	reclaimFlag := fs.Bool("reclaim", false,
@@ -3492,9 +3760,9 @@ func printUsageReportJSON(summary *store.ClassificationSummary, user string, per
 	report := map[string]interface{}{
 		"total_messages": summary.TotalMessages,
 		"work_non_work": map[string]int{
-			"work":    summary.WorkRelated,
+			"work":     summary.WorkRelated,
 			"non_work": summary.NonWorkRelated,
-			"unknown": summary.WorkUnknown,
+			"unknown":  summary.WorkUnknown,
 		},
 		"intent": map[string]int{
 			"asking":     summary.IntentAsking,
@@ -3502,8 +3770,8 @@ func printUsageReportJSON(summary *store.ClassificationSummary, user string, per
 			"expressing": summary.IntentExpressing,
 			"unknown":    summary.IntentUnknown,
 		},
-		"topic_groups":     summary.CoarseTopicCounts,
-		"topics_fine":      summary.TopicCounts,
+		"topic_groups": summary.CoarseTopicCounts,
+		"topics_fine":  summary.TopicCounts,
 	}
 	if user != "" {
 		report["user"] = user

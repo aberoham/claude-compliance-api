@@ -82,6 +82,20 @@ CREATE INDEX IF NOT EXISTS idx_chats_user_email ON chats(user_email);
 CREATE INDEX IF NOT EXISTS idx_chats_created_at ON chats(created_at);
 CREATE INDEX IF NOT EXISTS idx_chats_project_id ON chats(project_id);
 
+CREATE TABLE IF NOT EXISTS chat_transcripts (
+    chat_id       TEXT PRIMARY KEY,
+    user_id       TEXT,
+    user_email    TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    message_count INTEGER NOT NULL,
+    raw           TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_transcripts_user_email ON chat_transcripts(user_email);
+CREATE INDEX IF NOT EXISTS idx_chat_transcripts_created_at ON chat_transcripts(created_at);
+
 CREATE TABLE IF NOT EXISTS classifications (
     message_id       TEXT PRIMARY KEY,
     chat_id          TEXT NOT NULL,
@@ -191,9 +205,9 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("setting busy timeout: %w", err)
 	}
 
-	if _, err := db.Exec(schema); err != nil {
+	if err := applyMigrations(db); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("applying schema: %w", err)
+		return nil, fmt.Errorf("applying schema migrations: %w", err)
 	}
 
 	return &Store{db: db, path: path}, nil
