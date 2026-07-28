@@ -1,10 +1,11 @@
 # Compliance API gap analysis — 2026-07-15
 
-Contract source: the 60-page snapshot under
+Contract source: a local-only 60-page snapshot under
 `2026-07-15-compliance-api-docs-scrape/`, pinned by the SHA-256 hashes in its
-`extracted/manifest.json`. The snapshot contains 31 operations. The site's
-generic "Include beta APIs" setting was enabled during discovery, but no
-separate Compliance beta paths were identified.
+`extracted/manifest.json`. The snapshot is deliberately not checked into this
+repository. It contains 31 operations. The site's generic "Include beta APIs"
+setting was enabled during discovery, but no separate Compliance beta paths
+were identified.
 
 ## Executive summary
 
