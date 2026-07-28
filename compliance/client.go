@@ -35,6 +35,22 @@ type Client struct {
 	orgID      string
 }
 
+// APIError is returned for non-successful Compliance API responses.
+type APIError struct {
+	StatusCode int
+	Endpoint   string
+	RequestID  string
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	requestID := ""
+	if e.RequestID != "" {
+		requestID = fmt.Sprintf(" (request-id: %s)", e.RequestID)
+	}
+	return fmt.Sprintf("HTTP %d from %s%s: %s", e.StatusCode, e.Endpoint, requestID, truncate(e.Body, 500))
+}
+
 // NewClient creates a Client with an explicit API key.
 func NewClient(apiKey, orgID string) *Client {
 	return &Client{
@@ -63,9 +79,6 @@ func NewClientFrom1Password(opItem, opField, orgID string) (*Client, error) {
 	if orgID == "" {
 		orgID = DefaultOrgID()
 	}
-	if orgID == "" {
-		return nil, fmt.Errorf("ANTHROPIC_ORG_ID not set (configure in .env or pass --org)")
-	}
 
 	out, err := exec.Command("op", "item", "get", opItem, "--field", opField, "--reveal").Output()
 	if err != nil {
@@ -87,13 +100,20 @@ func (c *Client) OrgID() string {
 	return c.orgID
 }
 
-// doRequest executes an authenticated GET against the Compliance API and
-// returns the raw response body. It handles rate-limiting by respecting
-// Retry-After headers.
+// doRequest executes an authenticated GET against the Compliance API.
 func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Values) ([]byte, error) {
+	body, _, err := c.doRequestMethod(ctx, http.MethodGet, endpoint, params)
+	return body, err
+}
+
+// doRequestMethod executes an authenticated request and returns the response
+// body and headers. It retries documented transient statuses and honors
+// Retry-After. Callers should still make destructive operations explicit at
+// their own user-interface boundary.
+func (c *Client) doRequestMethod(ctx context.Context, method, endpoint string, params url.Values) ([]byte, http.Header, error) {
 	u, err := url.Parse(c.baseURL + endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("invalid endpoint %q: %w", endpoint, err)
+		return nil, nil, fmt.Errorf("invalid endpoint %q: %w", endpoint, err)
 	}
 	if params != nil {
 		u.RawQuery = params.Encode()
@@ -101,9 +121,9 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		req.Header.Set("x-api-key", c.apiKey)
 		req.Header.Set("Accept", "application/json")
@@ -116,48 +136,80 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 				fmt.Fprintf(os.Stderr, "  Timeout (attempt %d/5), retrying in %v...\n", attempt+1, wait)
 				select {
 				case <-ctx.Done():
-					return nil, ctx.Err()
+					return nil, nil, ctx.Err()
 				case <-time.After(wait):
 					continue
 				}
 			}
-			return nil, fmt.Errorf("request to %s failed: %w", endpoint, err)
+			return nil, nil, fmt.Errorf("request to %s failed: %w", endpoint, err)
 		}
 		body, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if err != nil {
-			return nil, fmt.Errorf("reading response body: %w", err)
+			return nil, nil, fmt.Errorf("reading response body: %w", err)
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests {
-			wait := 5 * time.Second
-			if ra := resp.Header.Get("Retry-After"); ra != "" {
-				if secs, err := strconv.Atoi(ra); err == nil {
-					wait = time.Duration(secs) * time.Second
-				}
-			}
+		if shouldRetry(resp.StatusCode, resp.Header) && attempt < 4 {
+			wait := retryDelay(resp.Header.Get("Retry-After"), attempt)
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, nil, ctx.Err()
 			case <-time.After(wait):
 				continue
 			}
 		}
 
 		if resp.StatusCode >= 400 {
-			return nil, fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, endpoint, truncate(string(body), 200))
+			return nil, resp.Header.Clone(), &APIError{
+				StatusCode: resp.StatusCode,
+				Endpoint:   endpoint,
+				RequestID:  resp.Header.Get("request-id"),
+				Body:       string(body),
+			}
 		}
-		return body, nil
+		return body, resp.Header.Clone(), nil
 	}
 	if lastErr != nil {
-		return nil, lastErr
+		return nil, nil, lastErr
 	}
-	return nil, fmt.Errorf("exceeded retry limit for %s", endpoint)
+	return nil, nil, fmt.Errorf("exceeded retry limit for %s", endpoint)
+}
+
+func shouldRetry(status int, header http.Header) bool {
+	if status == http.StatusInternalServerError && strings.EqualFold(header.Get("x-should-retry"), "false") {
+		return false
+	}
+	return status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
+		status == http.StatusBadGateway || status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout || status == 529
+}
+
+func retryDelay(retryAfter string, attempt int) time.Duration {
+	if retryAfter != "" {
+		if secs, err := strconv.Atoi(retryAfter); err == nil && secs >= 0 {
+			return time.Duration(secs) * time.Second
+		}
+		if when, err := http.ParseTime(retryAfter); err == nil {
+			if wait := time.Until(when); wait > 0 {
+				return wait
+			}
+			return 0
+		}
+	}
+	return time.Duration(1<<attempt) * time.Second
 }
 
 // get is a convenience wrapper that unmarshals the JSON response into dest.
 func (c *Client) get(ctx context.Context, endpoint string, params url.Values, dest interface{}) error {
 	body, err := c.doRequest(ctx, endpoint, params)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, dest)
+}
+
+func (c *Client) delete(ctx context.Context, endpoint string, dest interface{}) error {
+	body, _, err := c.doRequestMethod(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
 		return err
 	}

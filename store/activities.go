@@ -239,6 +239,30 @@ func (s *Store) UserSummaries(since time.Time) ([]StoredUserSummary, error) {
 	return results, rows.Err()
 }
 
+// ActivityActorIDs returns the distinct user actor IDs seen at or after since.
+func (s *Store) ActivityActorIDs(since time.Time) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT actor_id
+		FROM activities
+		WHERE actor_id IS NOT NULL AND created_at >= ?
+		ORDER BY actor_id
+	`, since.Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // UsersWithActiveIntegrations returns emails that have an
 // integration_user_connected event without a later
 // integration_user_disconnected. The returned map goes from email to the

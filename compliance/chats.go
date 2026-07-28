@@ -2,9 +2,9 @@ package compliance
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"time"
@@ -12,46 +12,91 @@ import (
 
 // ChatQuery specifies filters for fetching chats.
 type ChatQuery struct {
-	UserIDs      []string   // Filter by user IDs
-	ProjectIDs   []string   // Filter by project IDs
-	CreatedAtGte *time.Time // Filter by created_at >= this time
-	CreatedAtLt  *time.Time // Filter by created_at < this time
-	Limit        int        // Per-page limit (default 100)
+	UserIDs         []string
+	ProjectIDs      []string
+	OrganizationIDs []string
+	CreatedAtGT     *time.Time
+	CreatedAtGte    *time.Time
+	CreatedAtLt     *time.Time
+	CreatedAtLTE    *time.Time
+	UpdatedAtGT     *time.Time
+	UpdatedAtGTE    *time.Time
+	UpdatedAtLT     *time.Time
+	UpdatedAtLTE    *time.Time
+	OrderBy         string
+	AfterID         string
+	BeforeID        string
+	Limit           int
+	OnPage          func([]Chat, CursorPage) error
 }
 
 // FetchChats retrieves all chats matching the query, paginating automatically.
-// Results are returned in reverse chronological order (newest first).
+// Results are returned chronologically by created_at (oldest first).
 func (c *Client) FetchChats(ctx context.Context, opts ChatQuery) ([]Chat, error) {
+	if len(opts.UserIDs) > 10 {
+		return nil, fmt.Errorf("chat queries accept at most 10 user IDs")
+	}
+	if len(opts.ProjectIDs) > 0 && len(opts.UserIDs) == 0 {
+		return nil, fmt.Errorf("project chat filters require at least one user ID")
+	}
+	if opts.OrderBy != "" && opts.OrderBy != "created_at" && opts.OrderBy != "updated_at" {
+		return nil, fmt.Errorf("chat order_by must be created_at or updated_at")
+	}
+	if opts.AfterID != "" && opts.BeforeID != "" {
+		return nil, fmt.Errorf("chat after_id and before_id cannot be combined")
+	}
+	if opts.BeforeID != "" && len(opts.UserIDs) == 0 {
+		return nil, fmt.Errorf("chat before_id pagination requires at least one user ID")
+	}
 	limit := opts.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 100
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
 	}
 
 	var all []Chat
-	afterID := ""
+	afterID := opts.AfterID
+	beforeID := opts.BeforeID
+	backward := beforeID != ""
 	page := 0
+	total := 0
 
 	for {
 		params := url.Values{}
 		params.Set("limit", fmt.Sprintf("%d", limit))
 
-		if c.orgID != "" {
-			params.Add("organization_ids[]", c.orgID)
+		organizationIDs := opts.OrganizationIDs
+		if len(organizationIDs) == 0 && c.orgID != "" {
+			organizationIDs = []string{c.orgID}
 		}
+		for _, id := range organizationIDs {
+			params.Add("organization_ids[]", id)
+		}
+		addTimeParam(params, "created_at.gt", opts.CreatedAtGT)
 		if opts.CreatedAtGte != nil {
 			params.Set("created_at.gte", opts.CreatedAtGte.Format(time.RFC3339))
 		}
 		if opts.CreatedAtLt != nil {
 			params.Set("created_at.lt", opts.CreatedAtLt.Format(time.RFC3339))
 		}
+		addTimeParam(params, "created_at.lte", opts.CreatedAtLTE)
+		addTimeParam(params, "updated_at.gt", opts.UpdatedAtGT)
+		addTimeParam(params, "updated_at.gte", opts.UpdatedAtGTE)
+		addTimeParam(params, "updated_at.lt", opts.UpdatedAtLT)
+		addTimeParam(params, "updated_at.lte", opts.UpdatedAtLTE)
 		for _, id := range opts.UserIDs {
 			params.Add("user_ids[]", id)
 		}
 		for _, id := range opts.ProjectIDs {
 			params.Add("project_ids[]", id)
 		}
+		if opts.OrderBy != "" {
+			params.Set("order_by", opts.OrderBy)
+		}
 		if afterID != "" {
 			params.Set("after_id", afterID)
+		}
+		if beforeID != "" {
+			params.Set("before_id", beforeID)
 		}
 
 		var resp ChatsResponse
@@ -59,69 +104,175 @@ func (c *Client) FetchChats(ctx context.Context, opts ChatQuery) ([]Chat, error)
 			return all, fmt.Errorf("page %d: %w", page, err)
 		}
 
-		all = append(all, resp.Data...)
+		cursor := resp.LastID
+		if backward {
+			cursor = resp.FirstID
+		}
+		if !resp.HasMore {
+			cursor = ""
+		}
+		if opts.OnPage != nil {
+			if err := opts.OnPage(resp.Data, CursorPage{NextCursor: cursor, HasMore: resp.HasMore}); err != nil {
+				return all, err
+			}
+		} else {
+			all = append(all, resp.Data...)
+		}
+		total += len(resp.Data)
 		page++
 
 		if page == 1 || page%5 == 0 {
-			fmt.Fprintf(os.Stderr, "  Page %d: %d chats\n", page, len(all))
+			fmt.Fprintf(os.Stderr, "  Page %d: %d chats\n", page, total)
 		}
 
-		if !resp.HasMore || resp.LastID == "" {
+		if cursor == "" {
 			break
 		}
-		afterID = resp.LastID
+		if backward {
+			beforeID = cursor
+		} else {
+			afterID = cursor
+		}
 	}
 
 	return all, nil
 }
 
+// ChatMessageQuery exposes the message endpoint's optional filtering,
+// truncation, ordering, and cursor controls.
+type ChatMessageQuery struct {
+	CreatedAtGT          *time.Time
+	CreatedAtGTE         *time.Time
+	CreatedAtLT          *time.Time
+	CreatedAtLTE         *time.Time
+	UpdatedAtGT          *time.Time
+	UpdatedAtGTE         *time.Time
+	UpdatedAtLT          *time.Time
+	UpdatedAtLTE         *time.Time
+	Order                string
+	AfterID              string
+	BeforeID             string
+	Limit                int
+	ToolResultMaxChars   *int
+	ToolUseInputMaxChars *int
+}
+
+// FetchChatMessages retrieves and, when a page limit is supplied, paginates
+// chat messages while preserving the chat metadata returned by the endpoint.
+func (c *Client) FetchChatMessages(ctx context.Context, chatID string, opts ChatMessageQuery) (*ChatDetail, error) {
+	if chatID == "" {
+		return nil, fmt.Errorf("chat ID is required")
+	}
+	if opts.Order != "" && opts.Order != "asc" && opts.Order != "desc" {
+		return nil, fmt.Errorf("message order must be asc or desc")
+	}
+	if opts.AfterID != "" && opts.BeforeID != "" {
+		return nil, fmt.Errorf("message after_id and before_id cannot be combined")
+	}
+	if opts.Limit < 0 || opts.Limit > 1000 {
+		return nil, fmt.Errorf("message limit must be between 0 and 1000")
+	}
+
+	endpoint := fmt.Sprintf("/v1/compliance/apps/chats/%s/messages", url.PathEscape(chatID))
+	afterID := opts.AfterID
+	beforeID := opts.BeforeID
+	backward := beforeID != ""
+	var combined *ChatDetail
+	for {
+		params := url.Values{}
+		addTimeParam(params, "created_at.gt", opts.CreatedAtGT)
+		addTimeParam(params, "created_at.gte", opts.CreatedAtGTE)
+		addTimeParam(params, "created_at.lt", opts.CreatedAtLT)
+		addTimeParam(params, "created_at.lte", opts.CreatedAtLTE)
+		addTimeParam(params, "updated_at.gt", opts.UpdatedAtGT)
+		addTimeParam(params, "updated_at.gte", opts.UpdatedAtGTE)
+		addTimeParam(params, "updated_at.lt", opts.UpdatedAtLT)
+		addTimeParam(params, "updated_at.lte", opts.UpdatedAtLTE)
+		if opts.Order != "" {
+			params.Set("order", opts.Order)
+		}
+		if opts.Limit > 0 {
+			params.Set("limit", fmt.Sprintf("%d", opts.Limit))
+		}
+		if opts.ToolResultMaxChars != nil {
+			params.Set("tool_result_max_chars", fmt.Sprintf("%d", *opts.ToolResultMaxChars))
+		}
+		if opts.ToolUseInputMaxChars != nil {
+			params.Set("tool_use_input_max_chars", fmt.Sprintf("%d", *opts.ToolUseInputMaxChars))
+		}
+		if afterID != "" {
+			params.Set("after_id", afterID)
+		}
+		if beforeID != "" {
+			params.Set("before_id", beforeID)
+		}
+
+		var page ChatDetail
+		if err := c.get(ctx, endpoint, params, &page); err != nil {
+			return nil, err
+		}
+		if combined == nil {
+			combined = &page
+		} else {
+			combined.ChatMessages = append(combined.ChatMessages, page.ChatMessages...)
+			combined.HasMore = page.HasMore
+			combined.LastID = page.LastID
+		}
+
+		// Omitting limit asks the API for the full result in one response.
+		if opts.Limit == 0 || !page.HasMore {
+			break
+		}
+		cursor := page.LastID
+		if backward {
+			cursor = page.FirstID
+		}
+		if cursor == "" {
+			break
+		}
+		if backward {
+			beforeID = cursor
+		} else {
+			afterID = cursor
+		}
+	}
+	return combined, nil
+}
+
 // GetChat retrieves a single chat by ID, including its full message history.
 func (c *Client) GetChat(ctx context.Context, chatID string) (*ChatDetail, error) {
-	endpoint := fmt.Sprintf("/v1/compliance/apps/chats/%s/messages", chatID)
-	var chat ChatDetail
-	if err := c.get(ctx, endpoint, nil, &chat); err != nil {
-		return nil, err
+	chat, _, err := c.GetChatRaw(ctx, chatID)
+	return chat, err
+}
+
+// GetChatRaw retrieves a chat and also returns the exact JSON response body.
+func (c *Client) GetChatRaw(ctx context.Context, chatID string) (*ChatDetail, []byte, error) {
+	if chatID == "" {
+		return nil, nil, fmt.Errorf("chat ID is required")
 	}
-	return &chat, nil
+	endpoint := fmt.Sprintf("/v1/compliance/apps/chats/%s/messages", url.PathEscape(chatID))
+	params := url.Values{}
+	params.Set("tool_result_max_chars", "-1")
+	params.Set("tool_use_input_max_chars", "-1")
+	var chat ChatDetail
+	body, err := c.doRequest(ctx, endpoint, params)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := json.Unmarshal(body, &chat); err != nil {
+		return nil, nil, err
+	}
+	return &chat, body, nil
 }
 
 // DownloadFile retrieves the content of a file attachment. Returns the body
 // (which the caller must close), the filename, and any error.
 func (c *Client) DownloadFile(ctx context.Context, fileID string) (io.ReadCloser, string, error) {
-	endpoint := fmt.Sprintf("/v1/compliance/apps/chats/files/%s/content", fileID)
-	u, err := url.Parse(c.baseURL + endpoint)
-	if err != nil {
-		return nil, "", fmt.Errorf("invalid endpoint: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	download, err := c.DownloadFileContent(ctx, fileID)
 	if err != nil {
 		return nil, "", err
 	}
-	req.Header.Set("x-api-key", c.apiKey)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("request failed: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		return nil, "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
-	}
-
-	// Extract filename from Content-Disposition header if present.
-	filename := fileID
-	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-		if _, params, err := parseContentDisposition(cd); err == nil {
-			if fn, ok := params["filename"]; ok {
-				filename = fn
-			}
-		}
-	}
-
-	return resp.Body, filename, nil
+	return download.Body, download.Filename, nil
 }
 
 // parseContentDisposition parses a Content-Disposition header value.
