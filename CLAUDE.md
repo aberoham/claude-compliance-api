@@ -63,6 +63,39 @@ audit users --refresh
 
 Flags: `--db`, `--org`, `--api-key`, `--refresh` (same semantics as `fetch`).
 
+### `audit sync-resources` — Mirror all Compliance resources
+
+Enumerates the current Compliance API resource graph into normalized SQLite
+tables while retaining raw JSON. Page cursors and snapshot generations are
+checkpointed so interrupted runs resume without pruning partially-seen data.
+
+```bash
+# Metadata plus full chat transcripts; no binary downloads
+audit sync-resources
+
+# Include project-document text
+audit sync-resources --content=text
+
+# Include binary files/artifacts in the local SHA-256 object store
+audit sync-resources --content=all
+
+# Bound individual downloads and choose the object directory
+audit sync-resources --content=all --max-content-bytes=1073741824 \
+  --objects-dir=/path/to/objects
+
+# Inspect cache coverage without contacting Anthropic
+audit sync-resources --status
+```
+
+Flags: `--db`, `--org`, `--api-key`, `--content` (`none`, `text`, or `all`),
+`--objects-dir`, `--max-content-bytes`, `--refresh-content`, `--skip-chats`, and
+`--status`.
+
+Binary content is not placed in SQLite. The local backend writes immutable
+objects beneath `<database-directory>/objects`, keyed by SHA-256, while SQLite
+stores backend-neutral object keys and resource links. This boundary is
+intended to support a later Google Cloud Storage backend.
+
 ### `audit compare <csv>` — Compare API data against CSV export
 
 ```bash
@@ -191,7 +224,7 @@ When chats exceed the token budget, the command samples intelligently: always in
 ### `audit rank` — Stack-ranked engagement table
 
 ```bash
-# Default: last 30 days, auto-fetches if data is stale (>1 hour)
+# Default: last 90 days, auto-fetches if data is stale (>1 hour)
 audit rank
 
 # Shorter window
@@ -207,7 +240,7 @@ audit rank --json | jq '.[0]'
 audit rank --analytics-api-key sk-ant-...
 ```
 
-Flags: `--db`, `--org`, `--api-key`, `--analytics-api-key`, `--days` (default 30), `--refresh`, `--json`, `--reclaim` (enables seat reclamation mode; see below).
+Flags: `--db`, `--org`, `--api-key`, `--analytics-api-key`, `--days` (default 90), `--refresh`, `--json`, `--reclaim` (enables seat reclamation mode; see below).
 
 Produces a ranked table of all licensed users sorted by category priority, then recency (most stale first), then event count ascending. The table includes activity breakdown columns: `Proj` (projects created), `Share` (chat snapshots + session shares), and `Files` (files uploaded). When analytics data is available, additional columns are shown: `Conv` (conversations), `Msgs` (messages), and `CC` (Claude Code sessions).
 

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -23,8 +24,8 @@ func (s *Store) InsertUsers(users []compliance.User, fetchedAt time.Time) error 
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO users (id, email, full_name, created_at, fetched_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO users (id, email, full_name, created_at, fetched_at, raw)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -34,7 +35,11 @@ func (s *Store) InsertUsers(users []compliance.User, fetchedAt time.Time) error 
 	ts := fetchedAt.Format(time.RFC3339)
 	for _, u := range users {
 		email := strings.ToLower(u.EffectiveEmail())
-		if _, err := stmt.Exec(u.ID, email, u.FullName, u.CreatedAt, ts); err != nil {
+		raw, err := json.Marshal(u)
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.Exec(u.ID, email, u.FullName, u.CreatedAt, ts, string(raw)); err != nil {
 			return err
 		}
 	}

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -17,8 +18,9 @@ func (s *Store) InsertProjects(projects []compliance.Project, fetchedAt time.Tim
 
 	stmt, err := tx.Prepare(`
 		INSERT OR REPLACE INTO projects
-		(id, name, description, instructions, creator_id, creator_email, org_id, created_at, updated_at, archived_at, fetched_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, name, description, instructions, creator_id, creator_email, org_id, created_at, updated_at, archived_at, fetched_at,
+		 org_uuid, deleted_at, is_private, raw)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -27,6 +29,10 @@ func (s *Store) InsertProjects(projects []compliance.Project, fetchedAt time.Tim
 
 	ts := fetchedAt.Format(time.RFC3339)
 	for _, p := range projects {
+		raw, err := json.Marshal(p)
+		if err != nil {
+			return err
+		}
 		var creatorEmail *string
 		creatorID := p.CreatorID
 		if p.Creator != nil {
@@ -44,6 +50,7 @@ func (s *Store) InsertProjects(projects []compliance.Project, fetchedAt time.Tim
 			p.ID, p.Name, p.Description, p.Instructions,
 			creatorID, creatorEmail, p.OrganizationID,
 			p.CreatedAt, p.UpdatedAt, p.ArchivedAt, ts,
+			p.OrganizationUUID, p.DeletedAt, p.IsPrivate, string(raw),
 		); err != nil {
 			return err
 		}

@@ -11,14 +11,21 @@ import (
 
 // ActivityQuery specifies filters for fetching activities.
 type ActivityQuery struct {
-	CreatedAtGte  *time.Time                // created_at.gte filter
-	CreatedAtLt   *time.Time                // created_at.lt filter
-	ActorIDs      []string                  // actor_ids[] filter
-	ActivityTypes []string                  // activity_types[] filter
-	Limit         int                       // per-page limit (default 5000, API max 5000)
-	BeforeID      string                    // for incremental fetch: get activities newer than this ID
-	AfterID       string                    // resume backfill: start pagination from this cursor
-	OnPage        func(PageResult) error    // called after each page; use to persist incrementally
+	CreatedAtGT                  *time.Time
+	CreatedAtGte                 *time.Time // retained name for compatibility; maps to created_at.gte
+	CreatedAtLt                  *time.Time // retained name for compatibility; maps to created_at.lt
+	CreatedAtLTE                 *time.Time
+	ActorIDs                     []string
+	UserIDs                      []string
+	OrganizationIDs              []string
+	ActivityTypes                []string
+	ExcludeActivityTypes         []string
+	IncludeComplianceAPIAccessed bool
+	Order                        string
+	Limit                        int
+	BeforeID                     string
+	AfterID                      string
+	OnPage                       func(PageResult) error
 }
 
 // PageResult is passed to the OnPage callback after each API response page.
@@ -42,6 +49,12 @@ type PageResult struct {
 // the entire fetch to complete. If OnPage returns an error, pagination stops
 // and that error is returned.
 func (c *Client) FetchActivities(ctx context.Context, opts ActivityQuery) ([]Activity, error) {
+	if len(opts.ActivityTypes) > 0 && len(opts.ExcludeActivityTypes) > 0 {
+		return nil, fmt.Errorf("activity types and excluded activity types cannot be combined")
+	}
+	if opts.Order != "" && opts.Order != "asc" && opts.Order != "desc" {
+		return nil, fmt.Errorf("activity order must be asc or desc")
+	}
 	limit := opts.Limit
 	if limit <= 0 || limit > 5000 {
 		limit = 5000
@@ -66,20 +79,35 @@ func (c *Client) FetchActivities(ctx context.Context, opts ActivityQuery) ([]Act
 		params := url.Values{}
 		params.Set("limit", fmt.Sprintf("%d", limit))
 
-		if c.orgID != "" {
-			params.Add("organization_ids[]", c.orgID)
+		organizationIDs := opts.OrganizationIDs
+		if len(organizationIDs) == 0 && c.orgID != "" {
+			organizationIDs = []string{c.orgID}
 		}
+		for _, id := range organizationIDs {
+			params.Add("organization_ids[]", id)
+		}
+		addTimeParam(params, "created_at.gt", opts.CreatedAtGT)
 		if opts.CreatedAtGte != nil {
 			params.Set("created_at.gte", opts.CreatedAtGte.Format(time.RFC3339))
 		}
 		if opts.CreatedAtLt != nil {
 			params.Set("created_at.lt", opts.CreatedAtLt.Format(time.RFC3339))
 		}
+		addTimeParam(params, "created_at.lte", opts.CreatedAtLTE)
 		for _, id := range opts.ActorIDs {
 			params.Add("actor_ids[]", id)
 		}
+		for _, id := range opts.UserIDs {
+			params.Add("user_ids[]", id)
+		}
 		for _, t := range opts.ActivityTypes {
 			params.Add("activity_types[]", t)
+		}
+		for _, t := range opts.ExcludeActivityTypes {
+			params.Add("exclude_activity_types[]", t)
+		}
+		if opts.Order != "" {
+			params.Set("order", opts.Order)
 		}
 
 		if forwardMode && beforeID != "" {
@@ -96,7 +124,7 @@ func (c *Client) FetchActivities(ctx context.Context, opts ActivityQuery) ([]Act
 
 		var pageActivities []Activity
 		for i := range resp.Data {
-			if resp.Data[i].Type == "compliance_api_accessed" {
+			if !opts.IncludeComplianceAPIAccessed && resp.Data[i].Type == "compliance_api_accessed" {
 				continue
 			}
 			pageActivities = append(pageActivities, resp.Data[i])
